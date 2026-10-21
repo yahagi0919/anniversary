@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Starry Sky 3D</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: radial-gradient(ellipse at 50% 110%, #172042 0%, #090d1c 55%, #03040a 100%) fixed;
+    color: #e8ecf8;
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  }
+  #sky {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+    pointer-events: none;
+  }
+  /* 右上の扉アイコン（index.htmlへ戻る） */
+  .home {
+    position: fixed;
+    top: calc(env(safe-area-inset-top, 0px) + 12px);
+    right: calc(env(safe-area-inset-right, 0px) + 14px);
+    z-index: 2;
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    color: #e8ecf8;
+    background: rgba(20, 26, 55, 0.45);
+    border: 1px solid rgba(200, 215, 255, 0.28);
+    border-radius: 50%;
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+    transition: background 0.2s, border-color 0.2s;
+  }
+  .home svg { width: 24px; height: 24px; }
+  .home:hover { background: rgba(40, 52, 105, 0.6); border-color: rgba(220, 230, 255, 0.5); }
+  .home:focus-visible { outline: 2px solid #bcd0ff; outline-offset: 3px; }
+
+  /* ページの内容（自由に差し替えてください） */
+  .content {
+    position: relative;
+    z-index: 1;
+    min-height: 100%;
+    display: grid;
+    place-items: center;
+    padding: env(safe-area-inset-top, 0px) 24px env(safe-area-inset-bottom, 0px);
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="sky" aria-hidden="true"></canvas>
+
+<a class="home" href="index.html" aria-label="トップページに戻る">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M6.5 21V4.5A1.5 1.5 0 0 1 8 3h8a1.5 1.5 0 0 1 1.5 1.5V21"/>
+    <path d="M3.5 21h17"/>
+    <circle cx="14.2" cy="12.5" r="0.9" fill="currentColor" stroke="none"/>
+  </svg>
+</a>
+
+<main class="content">
+  <p>やけくそ流れ星！</p>
+</main>
+
+<script>
+(function () {
+  // ===== 設定 =====
+  var SHOOT_MIN = 8, SHOOT_MAX = 12;  // 流れ星の間隔（秒）→ 平均で約10秒に1回
+  var FIRST_SHOT = 2;                 // 最初の流れ星が出るまで（秒）
+  var STAR_DENSITY = 3200;            // 小さいほど星が増える
+  var STAR_MAX = 520;                 // 星の最大数
+  var BRIGHT_COUNT = 14;              // 明るい小さな星の数
+
+  // ===== 流れ星に混ぜるPNG画像 =====
+  var IMAGES = ['tere.png'];        // 画像のファイル名（複数OK：['a.png', 'b.png']）。このHTMLと同じフォルダに置く
+  var IMG_SIZE = 80;                  // 画像の表示サイズ（px・長い辺）
+  var IMG_MIN = 25, IMG_MAX = 35;     // 画像が流れる間隔（秒）→ 平均で約30秒に1回
+  var FIRST_IMG = 6;                  // 最初の画像が流れるまで（秒）
+  var IMG_SPIN = false;               // trueにすると、流れながらくるくる回る
+  var DRIFT = 0.008;                  // 星空がゆっくり前進する速さ（0で停止）
+  var AMP = 0.03;                     // 視差（奥行き感）の強さ
+
+  var TAU = Math.PI * 2;
+  var canvas = document.getElementById('sky');
+  var ctx = canvas.getContext('2d');
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  var w = 0, h = 0, dpr = 1, S = 1, cx = 0, cy = 0, hx = 1, hy = 1;
+  var stars = [], shots = [], neb = null, NM = 40;
+  var time = 0, last = performance.now(), timer = FIRST_SHOT, imgTimer = FIRST_IMG;
+  var imgs = [];                      // 読み込みが終わった画像
+  var cam = { x: 0, y: 0 }, tgt = { x: 0, y: 0 }, scr = 0;
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  // 画像を読み込む。見つからない画像は黙って無視する（普通の流れ星はそのまま動く）
+  IMAGES.forEach(function (src) {
+    var im = new Image();
+    im.onload = function () { if (im.naturalWidth) imgs.push(im); };
+    im.src = src;
+  });
+  function mulberry(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  // ===== 奥行きのある星 =====
+  // 星は (x, y, z) の3D座標を持つ。zが小さいほど手前（大きく、明るく、視差で大きく動く）
+  function spawnStar(s, initial) {
+    var z = initial ? (s.bright ? rand(0.25, 0.9) : rand(0.08, 1)) : 1;
+    s.z = z;
+    s.x = rand(-1, 1) * hx * z;
+    s.y = rand(-1, 1) * hy * z;
+    s.f = initial ? 1 : 0;                       // 出現時はふわっと明るくなる
+    s.base = s.bright ? rand(0.85, 1) : rand(0.4, 1);
+    s.size = s.bright ? rand(2, 2.6) : (Math.random() < 0.08 ? rand(1.5, 2) : rand(0.7, 1.3));
+    s.speed = rand(0.6, 2.2);
+    s.phase = rand(0, TAU);
+    s.tint = Math.random() < 0.22 ? '190,210,255' : (Math.random() < 0.1 ? '255,225,190' : '255,255,255');
+  }
+
+  function makeStars(n) {
+    stars = [];
+    for (var i = 0; i < n; i++) {
+      var s = { bright: i < BRIGHT_COUNT };
+      spawnStar(s, true);
+      stars.push(s);
+    }
+  }
+
+  function updateStars(dt) {
+    for (var i = 0; i < stars.length; i++) {
+      var s = stars[i];
+      if (!reduce) {
+        s.z -= DRIFT * dt;
+        if (s.f < 1) s.f = Math.min(1, s.f + dt * 0.5);
+      }
+      s.sx = cx + (s.x - cam.x) / s.z * S;
+      s.sy = cy + (s.y - cam.y) / s.z * S;
+      if (!reduce && (s.z < 0.07 || s.sx < -20 || s.sx > w + 20 || s.sy < -20 || s.sy > h + 20)) {
+        spawnStar(s, false);
+        s.sx = cx + (s.x - cam.x) / s.z * S;
+        s.sy = cy + (s.y - cam.y) / s.z * S;
+      }
+    }
+  }
+
+  function drawStars(near) {
+    for (var i = 0; i < stars.length; i++) {
+      var s = stars[i];
+      if ((s.z <= 0.5) !== near) continue;
+      var r = Math.min(2.6, 0.5 / Math.pow(s.z, 0.7) * s.size);
+      var depthA = clamp(1.15 - s.z * 0.6, 0.45, 1);
+      var tw = reduce ? 1 : 0.65 + 0.35 * Math.sin(time * s.speed + s.phase);
+      var a = s.base * tw * depthA * s.f;
+      if (s.bright) {                             // 明るい小さな星：強いにじみと十字のきらめき
+        ctx.fillStyle = 'rgba(' + s.tint + ',' + (a * 0.22).toFixed(3) + ')';
+        ctx.beginPath(); ctx.arc(s.sx, s.sy, r * 4, 0, TAU); ctx.fill();
+        var L = r * 4.5;
+        ctx.strokeStyle = 'rgba(' + s.tint + ',' + (a * 0.55).toFixed(3) + ')';
+        ctx.lineWidth = 0.8;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(s.sx - L, s.sy); ctx.lineTo(s.sx + L, s.sy);
+        ctx.moveTo(s.sx, s.sy - L); ctx.lineTo(s.sx, s.sy + L);
+        ctx.stroke();
+      } else if (r > 1.6) {                       // 手前の星はにじみを足す
+        ctx.fillStyle = 'rgba(' + s.tint + ',' + (a * 0.14).toFixed(3) + ')';
+        ctx.beginPath(); ctx.arc(s.sx, s.sy, r * 3, 0, TAU); ctx.fill();
+      }
+      ctx.fillStyle = 'rgba(' + s.tint + ',' + a.toFixed(3) + ')';
+      ctx.beginPath(); ctx.arc(s.sx, s.sy, r, 0, TAU); ctx.fill();
+    }
+  }
+
+  // ===== 星雲と天の川（奥の背景。一度だけ描いて使い回す） =====
+  function buildNebula() {
+    var W = w + NM * 2, H = h + NM * 2;
+    neb = document.createElement('canvas');
+    neb.width = Math.round(W * dpr);
+    neb.height = Math.round(H * dpr);
+    var c = neb.getContext('2d');
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var r = mulberry(7);
+    c.globalCompositeOperation = 'lighter';
+
+    function blob(x, y, rad, rgb, a) {
+      var g = c.createRadialGradient(x, y, 0, x, y, rad);
+      g.addColorStop(0, 'rgba(' + rgb + ',' + a + ')');
+      g.addColorStop(1, 'rgba(' + rgb + ',0)');
+      c.fillStyle = g;
+      c.fillRect(x - rad, y - rad, rad * 2, rad * 2);
+    }
+    var m = Math.max(W, H);
+    blob(W * 0.18, H * 0.28, m * 0.55, '110,70,190', 0.22);
+    blob(W * 0.85, H * 0.58, m * 0.50, '30,120,160', 0.18);
+    blob(W * 0.55, H * 0.10, m * 0.40, '170,60,120', 0.12);
+
+    // 天の川：斜めの帯に細かい星の粒を集める
+    var x0 = -0.1 * W, y0 = 0.8 * H, x1 = 1.1 * W, y1 = 0.2 * H;
+    var dx = x1 - x0, dy = y1 - y0, len = Math.hypot(dx, dy);
+    var nx = -dy / len, ny = dx / len, band = Math.min(W, H) * 0.16;
+    for (var k = 0; k < 6; k++) {
+      var tt = (k + 0.5) / 6;
+      blob(x0 + dx * tt, y0 + dy * tt, band * 2.2, '150,165,235', 0.08);
+    }
+    for (var i = 0; i < 2200; i++) {
+      var t = r();
+      var g = (r() + r() + r() - 1.5) * band * 0.9;
+      var a = (0.1 + r() * 0.3) * (1 - Math.min(1, Math.abs(g) / (band * 1.4)));
+      var sz = 0.5 + r() * 0.8;
+      c.fillStyle = 'rgba(220,228,255,' + a.toFixed(3) + ')';
+      c.fillRect(x0 + dx * t + nx * g, y0 + dy * t + ny * g, sz, sz);
+    }
+  }
+
+  // ===== 流れ星（3D空間を飛ぶ。手前ほど速く、大きい） =====
+  function project(X, Y, Z) {
+    return [cx + (X - cam.x) / Z * S, cy + (Y - cam.y) / Z * S];
+  }
+
+  function spawnShot(img) {
+    var dir = Math.random() < 0.5 ? 1 : -1;
+    var ang = (img ? rand(15, 30) : rand(18, 36)) * Math.PI / 180;
+    var z = img ? rand(0.35, 0.5) : rand(0.22, 0.8);
+    var pxs = (img ? rand(0.22, 0.3) : rand(0.5, 0.75)) / z * S;  // 画面上の速さ(px/秒)。画像はゆっくり
+    var sx = dir === 1 ? rand(-0.05 * w, 0.3 * w) : rand(0.7 * w, 1.05 * w);
+    if (!img) sx = dir === 1 ? rand(-0.05 * w, 0.5 * w) : rand(0.5 * w, 1.05 * w);
+    var sy = img ? rand(0.05 * h, 0.4 * h) : rand(0.02 * h, 0.35 * h);
+    shots.push({
+      X: (sx - cx) / S * z, Y: (sy - cy) / S * z, Z: z,
+      vX: Math.cos(ang) * pxs * dir / S * z,
+      vY: Math.sin(ang) * pxs / S * z,
+      vZ: img ? 0 : -0.03,
+      tail: img ? rand(0.28, 0.36) : rand(0.14, 0.2),
+      life: img ? clamp(1.1 * w / (Math.cos(ang) * pxs), 1.6, 3) : clamp(0.9 * w / (Math.cos(ang) * pxs), 0.8, 1.5),
+      img: img || null,
+      age: 0
+    });
+  }
+
+  function drawShots(dt) {
+    for (var i = shots.length - 1; i >= 0; i--) {
+      var s = shots[i];
+      s.age += dt;
+      if (s.age >= s.life || s.Z < 0.06) { shots.splice(i, 1); continue; }
+      s.X += s.vX * dt; s.Y += s.vY * dt; s.Z += s.vZ * dt;
+
+      var t = s.age / s.life;
+      var alpha = Math.min(t / 0.12, 1) * Math.min((1 - t) / 0.4, 1);
+      var head = project(s.X, s.Y, s.Z);
+      var tl = project(s.X - s.vX * s.tail, s.Y - s.vY * s.tail, s.Z - s.vZ * s.tail);
+      var lw = s.img ? IMG_SIZE * 0.08 : clamp(0.55 / s.Z, 1, 3.2);   // 手前ほど太い
+      var kk = s.img ? 0.6 : 1;                                      // 画像の尾は少し控えめに
+
+      var g = ctx.createLinearGradient(head[0], head[1], tl[0], tl[1]);
+      g.addColorStop(0, 'rgba(255,255,255,' + (0.95 * alpha * kk).toFixed(3) + ')');
+      g.addColorStop(0.3, 'rgba(190,210,255,' + (0.45 * alpha * kk).toFixed(3) + ')');
+      g.addColorStop(1, 'rgba(160,190,255,0)');
+      ctx.strokeStyle = g;
+      ctx.lineWidth = lw;
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(head[0], head[1]); ctx.lineTo(tl[0], tl[1]); ctx.stroke();
+
+      if (s.img) {
+        // PNG画像：先頭に表示（奥行きに合わせて大きさが少し変わる）
+        var size = IMG_SIZE * 0.42 / s.Z;
+        var sc = size / Math.max(s.img.naturalWidth, s.img.naturalHeight);
+        var dw = s.img.naturalWidth * sc, dh = s.img.naturalHeight * sc;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.translate(head[0], head[1]);
+        if (IMG_SPIN) ctx.rotate(s.age * 2.2);
+        ctx.shadowColor = 'rgba(200,220,255,0.9)';
+        ctx.shadowBlur = 14;
+        ctx.drawImage(s.img, -dw / 2, -dh / 2, dw, dh);
+        ctx.restore();
+      } else {
+        ctx.save();
+        ctx.shadowColor = 'rgba(200,220,255,' + alpha.toFixed(3) + ')';
+        ctx.shadowBlur = 8 + lw * 3;
+        ctx.fillStyle = 'rgba(255,255,255,' + alpha.toFixed(3) + ')';
+        ctx.beginPath(); ctx.arc(head[0], head[1], lw * 0.9 + 0.6, 0, TAU); ctx.fill();
+        ctx.restore();
+      }
+    }
+  }
+
+  // ===== 描画の流れ：奥から手前へ =====
+  function render(dt) {
+    ctx.clearRect(0, 0, w, h);
+    if (neb) {                                    // 一番奥：星雲（動きが小さい）
+      ctx.drawImage(neb, -NM - cam.x / 1.6 * S, -NM - cam.y / 1.6 * S, w + NM * 2, h + NM * 2);
+    }
+    updateStars(dt);
+    drawStars(false);                             // 奥の星
+
+    drawStars(true);                              // 手前の星
+    if (!reduce) drawShots(dt);
+  }
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    time += dt;
+
+    // 何も操作しなくても、カメラがゆっくり揺れて立体感が出る
+    var ax = Math.sin(time * 0.13) * 0.5, ay = Math.cos(time * 0.17) * 0.35;
+    var k = Math.min(1, dt * 3);
+    cam.x += ((ax + tgt.x) * AMP - cam.x) * k;
+    cam.y += ((ay + tgt.y + scr) * AMP - cam.y) * k;
+
+    timer -= dt;
+    if (timer <= 0) { spawnShot(); timer = rand(SHOOT_MIN, SHOOT_MAX); }
+
+    imgTimer -= dt;
+    if (imgTimer <= 0) {
+      if (imgs.length) {
+        spawnShot(imgs[Math.floor(Math.random() * imgs.length)]);
+        imgTimer = rand(IMG_MIN, IMG_MAX);
+      } else {
+        imgTimer = 5;                             // 画像がまだ読み込めていなければ、少し待って再挑戦
+      }
+    }
+
+    render(dt);
+    requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    w = window.innerWidth; h = window.innerHeight;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    cx = w / 2; cy = h / 2;
+    S = Math.max(w, h) * 0.6;
+    hx = w / 2 / S * 1.12; hy = h / 2 / S * 1.12;
+    buildNebula();
+    var want = Math.min(STAR_MAX, Math.round(w * h / STAR_DENSITY));
+    if (!stars.length || Math.abs(want - stars.length) > stars.length * 0.15) makeStars(want);
+    if (reduce) render(0);
+  }
+
+  // ===== 操作：マウス・指・傾き・スクロールで視点が動く =====
+  window.addEventListener('pointermove', function (e) {
+    if (tilting) return;
+    tgt.x = (e.clientX / w - 0.5) * 2;
+    tgt.y = (e.clientY / h - 0.5) * 2;
+  }, { passive: true });
+
+  window.addEventListener('scroll', function () {
+    scr = Math.min(window.scrollY / h, 3) * 0.3;
+  }, { passive: true });
+
+  var tilting = false;
+  function onTilt(e) {
+    if (e.gamma == null || e.beta == null) return;
+    tilting = true;
+    tgt.x = clamp(e.gamma / 25, -1, 1);
+    tgt.y = clamp((e.beta - 55) / 25, -1, 1);
+  }
+  function enableTilt() {
+    // iPhone(iOS)は、タップなどの操作をきっかけに許可をもらう必要がある
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      DeviceOrientationEvent.requestPermission().then(function (r) {
+        if (r === 'granted') window.addEventListener('deviceorientation', onTilt);
+      }).catch(function () {});
+    } else {
+      window.addEventListener('deviceorientation', onTilt);
+    }
+  }
+  window.addEventListener('click', enableTilt, { once: true });
+
+  window.addEventListener('resize', resize);
+  resize();
+  if (!reduce) requestAnimationFrame(frame);
+})();
+</script>
+
+</body>
+</html>
